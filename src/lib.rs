@@ -10,7 +10,7 @@ pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
 
     let _ = fs::create_dir_all("/tmp");
 
-    let url = format!("http://10.0.2.2:8000/{}.tar.gz", package);
+    let url = format!("https://Amaterus1125.github.io/chpm/packages/{}.tar.gz", package);
     ui.render_progress_frame(20, 100, &["Downloading".to_string()], false);
 
     let mut response = reqwest::blocking::get(&url)

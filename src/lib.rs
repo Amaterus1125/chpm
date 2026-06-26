@@ -332,7 +332,7 @@ fn path_hint(prefix: &Path) {
         .any(|p| Path::new(p) == bin_dir);
 
     if !in_path {
-        eprintln!("\n💡 Add to PATH:");
+        eprintln!("\n Add to PATH:");
         eprintln!("   export PATH=\"{}:$PATH\"", bin_dir.display());
         eprintln!("   Add that line to ~/.bashrc to make it permanent.");
     }
@@ -342,7 +342,7 @@ fn path_hint(prefix: &Path) {
         let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
         let lib_str = lib_dir.to_string_lossy();
         if !ld.contains(lib_str.as_ref()) {
-            eprintln!("\n💡 If a package has shared libs, also add:");
+            eprintln!("\n If a package has shared libs, also add:");
             eprintln!("   export LD_LIBRARY_PATH=\"{}:$LD_LIBRARY_PATH\"", lib_dir.display());
         }
     }

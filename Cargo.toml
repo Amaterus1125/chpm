@@ -4,15 +4,10 @@ version = "1.3.1"
 edition = "2021"
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }
 flate2 = "1.0"
 tar = "0.4"
-sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
 serde_json = "1.0"
-chrono = "0.4"
-hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 libc = "0.2"
-crossterm = "0.27" 
+crossterm = "0.27"

@@ -1,0 +1,43 @@
+name: Auto-sync packages
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'   # every Sunday at midnight UTC
+  workflow_dispatch:        # also allows manual trigger from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write       # needed to git push
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq binutils zstd tar
+
+      - name: Sync packages from Arch
+        run: |
+          bash .github/scripts/sync-arch.sh
+
+      - name: Sync packages from Debian
+        run: |
+          bash .github/scripts/sync-debian.sh
+
+      - name: Commit updated packages
+        run: |
+          git config user.name  "chiral-bot"
+          git config user.email "chiral-bot@users.noreply.github.com"
+          git add packages/
+          # only commit if something actually changed
+          if git diff --cached --quiet; then
+            echo "No packages updated."
+          else
+            git commit -m "chiral-bot: auto-sync packages $(date -u '+%Y-%m-%d')"
+            git push
+          fi

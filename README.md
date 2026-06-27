@@ -1,225 +1,213 @@
 <div align="center">
 
-# 🧪 Chiral Package Manager
+# ⚗️ Chiral Package Manager
 
-**A fast, minimal binary package manager for Linux — built in Rust.**  
-Designed for custom Linux distros. Inspired by pacman. No source compilation needed.
+**A fast, dependency-aware package manager built in Rust**  
+*Born from a custom Linux distro built entirely from scratch using LFS/BLFS*
 
-![Version](https://img.shields.io/badge/version-2.0-orange)
-![Platform](https://img.shields.io/badge/platform-x86__64%20Linux-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square&logo=linux)](https://kernel.org/)
 
 </div>
 
 ---
 
-## 📦 What is Chiral?
+## What is Chiral?
 
-Chiral is a binary package manager — you install pre-compiled programs with a single command, just like `pacman -S` on Arch Linux. No compiling, no build tools, no dependencies to chase. Packages are hosted on GitHub and downloaded directly.
+Chiral is a binary package manager that works on **any Linux system** — including custom distros, LFS/BLFS builds, Arch, Debian, and anything in between.
 
-It handles:
-- Single binaries (`hello`, `bat`, `ripgrep`)
-- Complex packages with libs, headers, man pages (`alsa-lib`, `mesa`, `gtk`)
-- Symlinks for shared libraries (`libfoo.so → libfoo.so.1.2.3`)
-- Automatic `ldconfig` after install/remove (when run as root)
+Instead of requiring a specific distro or package format, Chiral uses a **3-way fallback chain** to find and install packages:
+
+```
+Your GitHub repo packages/
+        ↓ (not found?)
+  Debian stable repos
+        ↓ (not found?)
+   Arch Linux repos
+```
+
+If a package exists anywhere in that chain, Chiral will find it, download it, and install it — automatically resolving all dependencies first.
 
 ---
 
-## ⚡ Install Chiral
+## Features
 
-```bash
-curl -sSL https://raw.githubusercontent.com/Amaterus1125/chpm/main/install.sh | bash
+- 🔗 **Automatic dependency resolution** — full recursive dep tree, installed in the right order
+- 🌐 **3-way fallback** — GitHub → Debian → Arch, so almost any package is available
+- 🧠 **Smart system detection** — checks pacman, dpkg, pkg-config, ldconfig, PATH, and the filesystem before downloading anything already present
+- 📦 **Clean installs and removes** — every installed file is tracked, `chiral remove` leaves no orphans
+- 🔢 **Real version pinning** — stores actual version strings from Debian/Arch APIs, not just "latest"
+- 👤 **Root and user modes** — installs system-wide as root, or into `~/.local` as a regular user
+- 🔄 **Weekly auto-sync** — GitHub Actions automatically keeps your package repo up to date
+- 🦀 **Written in Rust** — fast, safe, no runtime dependencies
+
+---
+
+## How it works
+
+### Installation
+
+```
+chiral install gtk3
 ```
 
-Then add to PATH (only needed once):
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+1. **Resolve deps** — queries Arch Linux API recursively to build the full dependency tree
+2. **Check what's already there** — each dep is checked against: chiral DB → system package manager → PATH → ldconfig → pkg-config → filesystem. Anything already present is skipped
+3. **Download missing deps** — tries GitHub packages/ first, then Debian, then Arch
+4. **Install in order** — deepest dependencies first, requested package last
+5. **Track files** — every installed file path is recorded in the local DB for clean removal later
+
+### Dependency resolution
+
+Chiral uses **BFS + Kahn's topological sort**:
+
+```
+gtk3
+ ├── glib2       ← installed first
+ ├── cairo
+ │    └── pixman ← installed before cairo
+ ├── pango
+ └── gdk-pixbuf2
 ```
 
-For packages with shared libraries, also add:
-```bash
-echo 'export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"' >> ~/.bashrc
-source ~/.bashrc
+Circular dependencies are detected and broken automatically.
+
+### File tracking DB
+
+Every package install is recorded at:
+- Root installs: `/var/lib/chiral/installed.db`
+- User installs: `~/.local/share/chiral/installed.db`
+
+Format:
+```
+[alsa-lib=1.2.10-1|arch]
+/usr/local/lib/libasound.so
+/usr/local/include/alsa/asoundlib.h
+...
 ```
 
 ---
 
-## 🚀 Usage
+## Installation
+
+### Download the binary
+
+Grab the latest release from the [Releases page](../../releases) and put it in your PATH:
 
 ```bash
-chiral install <package>    # Install a package
-chiral remove  <package>    # Remove a package and all its files
-chiral update  <package>    # Update a package to latest version
-chiral upgrade              # Update every installed package
+# As root (system-wide)
+sudo cp chiral /usr/local/bin/chiral
+
+# As user
+cp chiral ~/.local/bin/chiral
+export PATH="$HOME/.local/bin:$PATH"  # add to ~/.bashrc
+```
+
+### Build from source
+
+Requires Rust 1.70+:
+
+```bash
+git clone https://github.com/Amaterus1125/Chiral-Package-Manager---For-Custom-Distro-made-using-LFS-BLFS
+cd Chiral-Package-Manager---For-Custom-Distro-made-using-LFS-BLFS
+cargo build --release
+sudo cp target/release/chiral /usr/local/bin/chiral
+```
+
+---
+
+## Usage
+
+```bash
+chiral install <package>    # Install a package and all its dependencies
+chiral remove  <package>    # Remove an installed package
+chiral update  <package>    # Update a package to the latest version
+chiral upgrade              # Update all installed packages
 chiral search  <query>      # Search available packages
-chiral list                 # List all installed packages
+chiral list                 # List installed packages with version and source
+chiral info    <package>    # Show version, source, deps, and installed files
+chiral deps    <package>    # Preview what would be installed (dry run)
 ```
 
 ### Examples
-```bash
-chiral install hello
-chiral install alsa-lib
-chiral search audio
-chiral list
-chiral remove hello
-chiral upgrade
-```
-
----
-
-## 📁 Install Locations
-
-| Running as | Binaries | Libraries | Headers | DB |
-|---|---|---|---|---|
-| normal user | `~/.local/bin` | `~/.local/lib` | `~/.local/include` | `~/.local/share/chiral/` |
-| root (sudo) | `/usr/local/bin` | `/usr/local/lib` | `/usr/local/include` | `/var/lib/chiral/` |
-
----
-
-## 🗂 Repository Structure
-
-```
-chpm/
-├── src/
-│   ├── lib.rs          # Core package manager logic
-│   ├── main.rs         # CLI entry point
-│   └── ui.rs           # Terminal UI / progress bar
-├── packages/           # All .tar.gz package files live here
-│   ├── hello.tar.gz
-│   ├── alsa-lib.tar.gz
-│   └── ...
-├── Cargo.toml          # Rust dependencies
-├── Cargo.lock
-├── install.sh          # One-liner installer script
-└── README.md
-```
-
----
-
-## 📦 How to Add a Package
-
-Packages are pre-compiled binaries packed into `.tar.gz` files.  
-The tarball must follow this directory structure:
-
-```
-usr/
-├── bin/        → executables
-├── lib/        → shared libraries (.so files)
-├── include/    → header files (.h files)
-└── share/
-    ├── man/    → man pages
-    └── doc/    → documentation
-```
-
-### Step-by-step: packaging from your Operating system
 
 ```bash
-# 1. Compile the package normally on your BLFS system
-./configure --prefix=/usr
-make
+# See what installing ffmpeg would pull in — without installing anything
+chiral deps ffmpeg
 
-# 2. Install into a staging directory (not live system)
-make DESTDIR=/tmp/staging install
+# Install nano (chiral figures out all deps automatically)
+chiral install nano
 
-# 3. Check what was installed
-find /tmp/staging -type f
+# See info about an installed package
+chiral info steam
 
-# 4. Repack cleanly for chiral
-cd /tmp/staging
-tar -czf alsa-lib.tar.gz usr/
-
-# 5. Upload alsa-lib.tar.gz to the packages/ folder in this repo
-# 6. Anyone can now run:
-chiral install alsa-lib
-```
-
-### Simple single-binary package
-```bash
-# For a single binary like 'hello'
-mkdir -p /tmp/staging/usr/bin
-cp hello /tmp/staging/usr/bin/
-cd /tmp/staging
-tar -czf hello.tar.gz usr/
+# Remove a package cleanly
+chiral remove nano
 ```
 
 ---
 
-## 🔧 Build from Source
+## Supported platforms
 
-Requires Rust. Install it with:
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+Chiral runs on any **Linux x86_64** system:
 
-Then build chiral:
-```bash
-git clone https://github.com/Amaterus1125/chpm
-cd chpm
-cargo build --release
-
-# Install system-wide
-sudo cp target/release/chiral /usr/local/bin/chiral
-
-# Or user-only
-cp target/release/chiral ~/.local/bin/chiral
-```
+| Platform | Support | Notes |
+|---|---|---|
+| Arch Linux | ✅ Full | pacman used for dep checking |
+| Debian / Ubuntu | ✅ Full | dpkg used for dep checking |
+| LFS / BLFS | ✅ Full | filesystem + ldconfig + pkg-config used |
+| Any Linux x86_64 | ✅ Full | falls back to PATH + ldconfig checks |
+| macOS / Windows | ❌ | Linux only |
 
 ---
 
-## 🖥 Using on Your Own LFS Distro
+## Running as root vs user
 
-Copy the chiral binary into your LFS system during build:
-```bash
-# During LFS chroot or post-install
-cp chiral-x86_64-linux /usr/local/bin/chiral
-chmod +x /usr/local/bin/chiral
-```
-
-After booting your distro, users can immediately run:
-```bash
-chiral install <anything-in-your-packages-folder>
-```
+| | Root (`sudo chiral`) | User (`chiral`) |
+|---|---|---|
+| Install prefix | `/usr/local` | `~/.local` |
+| DB location | `/var/lib/chiral/` | `~/.local/share/chiral/` |
+| ldconfig | runs automatically | skipped |
+| Who can use it | everyone | current user only |
 
 ---
 
-## 🗃 How the Package Database Works
+## Auto-sync (GitHub Actions)
 
-Chiral tracks every single file each package installs.  
-Example entry in `installed.db`:
+The `packages/` folder in this repo is automatically kept up to date every week via GitHub Actions. Every Sunday at midnight UTC, the workflow:
+
+1. Checks Arch Linux repos for newer versions of every package
+2. Downloads and repacks updated packages as `.tar.gz`
+3. Falls back to Debian for packages not in Arch
+4. Commits only if something actually changed
+
+You can also trigger a sync manually from the Actions tab.
+
+---
+
+## Adding your own packages
+
+Drop a `.tar.gz` into `packages/` with the structure:
+
 ```
-[alsa-lib=latest]
-/usr/local/lib/libasound.so.2.0.0
-/usr/local/lib/libasound.so.2
-/usr/local/lib/libasound.so
-/usr/local/include/alsa/asoundlib.h
-/usr/local/share/man/man3/snd_pcm_open.3
+pkgname.tar.gz
+└── usr/
+    ├── bin/pkgname
+    ├── lib/libpkgname.so
+    └── include/pkgname/
 ```
 
-When you run `chiral remove alsa-lib`, every one of those files gets deleted cleanly — no leftover files ever.
+Chiral will find it automatically on the next `chiral install pkgname`.
 
 ---
 
-## 📋 Roadmap
+## Origin story
 
-- [ ] Package versioning (replace `latest` with real versions)
-- [ ] Dependency resolution
-- [ ] Package signing / verification
-- [ ] Multiple repository support
-- [ ] `chiral info <package>` command
+Chiral was built as the package manager for a custom Linux distribution assembled entirely from scratch using [Linux From Scratch (LFS)](https://www.linuxfromscratch.org/) and [Beyond LFS (BLFS)](https://www.linuxfromscratch.org/blfs/). Every package in the base system — GCC, glibc, systemd, XFCE — was compiled by hand. Chiral was created so that distro could install software without depending on any existing package manager.
 
 ---
 
-## 🤝 Contributing a Package
+## License
 
-1. Fork this repo
-2. Compile the package on an LFS/BLFS system
-3. Create the tarball following the structure above
-4. Add it to `packages/`
-5. Open a pull request
-
----
-
-<div align="center">
-Built with ❤️ for custom Linux distros
-</div>
+MIT — do whatever you want with it.

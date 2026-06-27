@@ -1,6 +1,7 @@
 pub mod ui;
 
 use flate2::read::GzDecoder;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -13,21 +14,7 @@ use crate::ui::ChiralUI;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SERVER: &str = "https://raw.githubusercontent.com/Amaterus1125/chpm/main/packages";
-const DEBIAN_MIRROR: &str = "http://deb.debian.org/debian/pool/main";
 const ARCH_MIRROR: &str = "https://mirror.rackspace.com/archlinux";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PackageInfo — returned by info_package, also used internally during install
-// to carry real version strings from Debian/Arch APIs
-// ─────────────────────────────────────────────────────────────────────────────
-
-pub struct PackageInfo {
-    pub name:        String,
-    pub version:     String,   // real upstream version e.g. "1.2.10-1" or "6.2.0-1"
-    pub source:      String,   // "github" | "debian" | "arch"
-    pub files:       Vec<PathBuf>,
-    pub install_prefix: PathBuf,
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Paths
@@ -88,7 +75,6 @@ fn db_read_all() -> Result<String, String> {
     fs::read_to_string(db_file()?).map_err(|e| e.to_string())
 }
 
-/// Returns (name, version, source) for every installed package
 pub fn db_list() -> Result<Vec<(String, String, String)>, String> {
     let raw = db_read_all()?;
     let mut out = Vec::new();
@@ -96,7 +82,6 @@ pub fn db_list() -> Result<Vec<(String, String, String)>, String> {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
             let inner = &line[1..line.len()-1];
-            // format: name=version|source
             let mut eq = inner.splitn(2, '=');
             let name = eq.next().unwrap_or("").to_string();
             let rest = eq.next().unwrap_or("unknown|unknown");
@@ -122,9 +107,7 @@ fn db_files_for(package: &str) -> Result<Vec<PathBuf>, String> {
         }
         if in_block {
             if line.starts_with('[') { break; }
-            if !line.is_empty() {
-                files.push(PathBuf::from(line));
-            }
+            if !line.is_empty() { files.push(PathBuf::from(line)); }
         }
     }
     Ok(files)
@@ -143,7 +126,6 @@ fn db_get_entry(package: &str) -> Option<(String, String)> {
         .map(|(_, v, s)| (v, s))
 }
 
-/// Write or overwrite a package entry — version and source stored separately
 fn db_add(package: &str, version: &str, source: &str, files: &[PathBuf]) -> Result<(), String> {
     let raw = db_read_all()?;
     let mut new_content = String::new();
@@ -155,16 +137,13 @@ fn db_add(package: &str, version: &str, source: &str, files: &[PathBuf]) -> Resu
             skip = true;
             continue;
         }
-        if skip && trimmed.starts_with('[') {
-            skip = false;
-        }
+        if skip && trimmed.starts_with('[') { skip = false; }
         if !skip {
             new_content.push_str(line);
             new_content.push('\n');
         }
     }
 
-    // [name=version|source]
     new_content.push_str(&format!("[{}={}|{}]\n", package, version, source));
     for f in files {
         new_content.push_str(&format!("{}\n", f.display()));
@@ -184,9 +163,7 @@ fn db_remove_entry(package: &str) -> Result<(), String> {
             skip = true;
             continue;
         }
-        if skip && trimmed.starts_with('[') {
-            skip = false;
-        }
+        if skip && trimmed.starts_with('[') { skip = false; }
         if !skip {
             new_content.push_str(line);
             new_content.push('\n');
@@ -218,7 +195,138 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Debian fallback — returns (url, real_version)
+// Arch API — returns full package info including deps
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ArchPkg {
+    repo:     String,
+    pkgname:  String,
+    version:  String,   // pkgver-pkgrel
+    arch:     String,
+    depends:  Vec<String>,
+}
+
+fn arch_query(package: &str) -> Result<ArchPkg, String> {
+    let api = format!(
+        "https://archlinux.org/packages/search/json/?name={}",
+        package
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(&api)
+        .header("User-Agent", "chiral-package-manager")
+        .send()
+        .map_err(|e| format!("Arch API error: {}", e))?
+        .text()
+        .map_err(|e| e.to_string())?;
+
+    let json: serde_json::Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("Arch API parse error: {}", e))?;
+
+    let results = json["results"]
+        .as_array()
+        .ok_or("No results from Arch API")?;
+
+    if results.is_empty() {
+        return Err(format!("'{}' not found in Arch repos", package));
+    }
+
+    let pkg = results.iter()
+        .find(|r| {
+            let repo = r["repo"].as_str().unwrap_or("");
+            repo == "core" || repo == "extra"
+        })
+        .or_else(|| results.first())
+        .ok_or("No suitable Arch package found")?;
+
+    let repo     = pkg["repo"].as_str().unwrap_or("extra").to_string();
+    let arch_str = pkg["arch"].as_str().unwrap_or("x86_64").to_string();
+    let pkgname  = pkg["pkgname"].as_str().unwrap_or(package).to_string();
+    let pkgver   = pkg["pkgver"].as_str().unwrap_or("").to_string();
+    let pkgrel   = pkg["pkgrel"].as_str().unwrap_or("1").to_string();
+    let version  = format!("{}-{}", pkgver, pkgrel);
+
+    // Parse depends array — entries can have version constraints like "glib2>=2.80"
+    // We strip the version constraint and just keep the name
+    let depends: Vec<String> = pkg["depends"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|d| d.as_str())
+        .map(|d| {
+            // Strip >=, <=, =, >, < version constraints
+            d.split(|c| c == '>' || c == '<' || c == '=')
+             .next()
+             .unwrap_or(d)
+             .trim()
+             .to_string()
+        })
+        .collect();
+
+    Ok(ArchPkg { repo, pkgname, version, arch: arch_str, depends })
+}
+
+fn arch_download_url(pkg: &ArchPkg) -> String {
+    let filename = format!(
+        "{}-{}-{}.pkg.tar.zst",
+        pkg.pkgname, pkg.version, pkg.arch
+    );
+    format!("{}/{}/os/x86_64/{}", ARCH_MIRROR, pkg.repo, filename)
+}
+
+fn extract_pkg_zst(pkg_path: &Path, dest: &Path) -> Result<(), String> {
+    let tmp_dir = pkg_path.parent().unwrap_or(Path::new("/tmp"))
+        .join("arch_extracted");
+    fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+
+    let status = std::process::Command::new("tar")
+        .args([
+            "xf", pkg_path.to_str().unwrap(),
+            "-C", tmp_dir.to_str().unwrap(),
+            "--exclude=.PKGINFO",
+            "--exclude=.BUILDINFO",
+            "--exclude=.MTREE",
+            "--exclude=.INSTALL",
+        ])
+        .status()
+        .map_err(|e| format!("tar failed: {}", e))?;
+
+    if !status.success() {
+        return Err("Failed to extract .pkg.tar.zst — is zstd installed?".to_string());
+    }
+
+    let status = std::process::Command::new("tar")
+        .args(["czf", dest.to_str().unwrap(), "-C", tmp_dir.to_str().unwrap(), "."])
+        .status()
+        .map_err(|e| format!("tar repack failed: {}", e))?;
+
+    if !status.success() {
+        return Err("Failed to repack Arch package as .tar.gz".to_string());
+    }
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+    Ok(())
+}
+
+fn try_arch(package: &str, dest: &Path) -> Result<(String, Vec<String>), String> {
+    let pkg = arch_query(package)?;
+    let version = pkg.version.clone();
+    let deps    = pkg.depends.clone();
+    let url     = arch_download_url(&pkg);
+
+    let pkg_tmp = dest.parent().unwrap_or(Path::new("/tmp"))
+        .join(format!("chiral-{}.pkg.tar.zst", package));
+
+    download(&url, &pkg_tmp)?;
+    extract_pkg_zst(&pkg_tmp, dest)?;
+    let _ = fs::remove_file(&pkg_tmp);
+
+    Ok((version, deps))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debian fallback
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn debian_find_deb(package: &str) -> Result<(String, String), String> {
@@ -236,8 +344,6 @@ fn debian_find_deb(package: &str) -> Result<(String, String), String> {
         .text()
         .map_err(|e| e.to_string())?;
 
-    // Extract .deb URL and parse version from filename
-    // filename pattern: pkgname_1.2.3-1_amd64.deb
     for line in page.lines() {
         if line.contains("deb.debian.org") && line.contains(".deb") {
             if let Some(start) = line.find("href=\"") {
@@ -245,9 +351,7 @@ fn debian_find_deb(package: &str) -> Result<(String, String), String> {
                 if let Some(end) = rest.find('"') {
                     let url = &rest[..end];
                     if url.ends_with(".deb") {
-                        // Extract version from filename
                         let filename = url.split('/').last().unwrap_or("");
-                        // filename: pkgname_VERSION_amd64.deb
                         let version = filename
                             .trim_end_matches("_amd64.deb")
                             .splitn(2, '_')
@@ -272,7 +376,7 @@ fn extract_deb(deb_path: &Path, dest: &Path) -> Result<(), String> {
         .args(["x", deb_path.to_str().unwrap()])
         .current_dir(&tmp_dir)
         .status()
-        .map_err(|e| format!("ar not found — install binutils: {}", e))?;
+        .map_err(|e| format!("ar not found: {}", e))?;
 
     if !status.success() {
         return Err("Failed to extract .deb with ar".to_string());
@@ -319,7 +423,6 @@ fn try_debian(package: &str, dest: &Path) -> Result<String, String> {
     let (deb_url, version) = debian_find_deb(package)?;
     let deb_tmp = dest.parent().unwrap_or(Path::new("/tmp"))
         .join(format!("chiral-{}.deb", package));
-
     download(&deb_url, &deb_tmp)?;
     extract_deb(&deb_tmp, dest)?;
     let _ = fs::remove_file(&deb_tmp);
@@ -327,106 +430,289 @@ fn try_debian(package: &str, dest: &Path) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Arch fallback — returns (url, real_version)
+// Dependency resolution
+//
+// Uses Arch API for dep lists (most complete and structured).
+// Builds a full install order via BFS then topological sort so deepest
+// deps install first.
+//
+// Returns Vec<String> in install order, NOT including packages already
+// installed, NOT including the root package itself (caller installs that).
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn arch_find_pkg(package: &str) -> Result<(String, String), String> {
-    let api = format!(
-        "https://archlinux.org/packages/search/json/?name={}",
-        package
-    );
-
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .get(&api)
-        .header("User-Agent", "chiral-package-manager")
-        .send()
-        .map_err(|e| format!("Arch API error: {}", e))?
-        .text()
-        .map_err(|e| e.to_string())?;
-
-    let json: serde_json::Value = serde_json::from_str(&resp)
-        .map_err(|e| format!("Arch API parse error: {}", e))?;
-
-    let results = json["results"]
-        .as_array()
-        .ok_or("No results from Arch API")?;
-
-    if results.is_empty() {
-        return Err(format!("'{}' not found in Arch repos", package));
-    }
-
-    let pkg = results.iter()
-        .find(|r| {
-            let repo = r["repo"].as_str().unwrap_or("");
-            repo == "core" || repo == "extra"
-        })
-        .or_else(|| results.first())
-        .ok_or("No suitable Arch package found")?;
-
-    let repo     = pkg["repo"].as_str().unwrap_or("extra");
-    let arch_str = pkg["arch"].as_str().unwrap_or("x86_64");
-    let pkgname  = pkg["pkgname"].as_str().unwrap_or(package);
-    let pkgver   = pkg["pkgver"].as_str().unwrap_or("");
-    let pkgrel   = pkg["pkgrel"].as_str().unwrap_or("1");
-
-    let version  = format!("{}-{}", pkgver, pkgrel);
-    let filename = format!("{}-{}-{}.pkg.tar.zst", pkgname, version, arch_str);
-    let url      = format!("{}/{}/os/x86_64/{}", ARCH_MIRROR, repo, filename);
-
-    Ok((url, version))
+/// Strip version constraints from a dep string e.g. "glib2>=2.80" → "glib2"
+fn strip_ver(dep: &str) -> String {
+    dep.split(|c| c == '>' || c == '<' || c == '=' || c == ':')
+        .next()
+        .unwrap_or(dep)
+        .trim()
+        .to_string()
 }
 
-fn extract_pkg_zst(pkg_path: &Path, dest: &Path) -> Result<(), String> {
-    let tmp_dir = pkg_path.parent().unwrap_or(Path::new("/tmp"))
-        .join("arch_extracted");
-    fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+/// Detect which package manager the host OS uses
+enum HostPm { Pacman, Apt, Rpm, Unknown }
 
-    let status = std::process::Command::new("tar")
-        .args([
-            "xf", pkg_path.to_str().unwrap(),
-            "-C", tmp_dir.to_str().unwrap(),
-            "--exclude=.PKGINFO",
-            "--exclude=.BUILDINFO",
-            "--exclude=.MTREE",
-            "--exclude=.INSTALL",
-        ])
+fn detect_host_pm() -> HostPm {
+    if std::process::Command::new("pacman").arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false) {
+        return HostPm::Pacman;
+    }
+    if std::process::Command::new("dpkg").arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false) {
+        return HostPm::Apt;
+    }
+    if std::process::Command::new("rpm").arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false) {
+        return HostPm::Rpm;
+    }
+    HostPm::Unknown
+}
+
+/// Check if a dep is already satisfied by the host OS.
+/// Checks 4 ways in order:
+///   1. chiral's own DB (we installed it)
+///   2. host package manager (pacman -Q / dpkg -s / rpm -q)
+///   3. binary exists on PATH (for things like "sh", "bash")
+///   4. shared lib visible to ldconfig (for "libfoo.so" style dep names)
+fn system_has(dep: &str, host_pm: &HostPm) -> bool {
+    // 1. Chiral DB
+    if db_is_installed(dep) { return true; }
+
+    // 2. Host package manager
+    let pm_found = match host_pm {
+        HostPm::Pacman => std::process::Command::new("pacman")
+            .args(["-Q", dep])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+
+        HostPm::Apt => std::process::Command::new("dpkg")
+            .args(["-s", dep])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+
+        HostPm::Rpm => std::process::Command::new("rpm")
+            .args(["-q", dep])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+
+        HostPm::Unknown => false,
+    };
+    if pm_found { return true; }
+
+    // 3. Binary on PATH (handles "sh", "bash", "python", etc.)
+    let bin_found = std::process::Command::new("sh")
+        .args(["-c", &format!("command -v {}", dep)])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("tar failed: {}", e))?;
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if bin_found { return true; }
 
-    if !status.success() {
-        return Err("Failed to extract .pkg.tar.zst — is zstd installed?".to_string());
+    // 4. Shared lib visible to ldconfig (handles "libfoo.so", "libz.so" etc.)
+    if dep.contains(".so") {
+        let ldconfig_found = std::process::Command::new("sh")
+            .args(["-c", &format!("ldconfig -p 2>/dev/null | grep -q '{}'", dep)])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ldconfig_found { return true; }
+
+        // Direct lib path check
+        let lib_paths = [
+            format!("/usr/lib/{}", dep),
+            format!("/lib/{}", dep),
+            format!("/usr/local/lib/{}", dep),
+            format!("/usr/lib/x86_64-linux-gnu/{}", dep),
+        ];
+        if lib_paths.iter().any(|p| Path::new(p).exists()) {
+            return true;
+        }
     }
 
-    let status = std::process::Command::new("tar")
-        .args(["czf", dest.to_str().unwrap(), "-C", tmp_dir.to_str().unwrap(), "."])
+    // 5. pkg-config — covers manually compiled libraries that ran `make install`
+    // e.g. alsa-lib installs alsa.pc, so `pkg-config --exists alsa` works
+    let pc_found = std::process::Command::new("pkg-config")
+        .args(["--exists", dep])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("tar repack failed: {}", e))?;
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if pc_found { return true; }
 
-    if !status.success() {
-        return Err("Failed to repack Arch package as .tar.gz".to_string());
+    // Also try common pkg-config name variants:
+    // dep "alsa-lib" → try "alsa", dep "libpng" → try "libpng16" etc.
+    let variants = [
+        dep.trim_start_matches("lib").to_string(),          // libfoo → foo
+        dep.replace('-', "_"),                               // alsa-lib → alsa_lib
+        dep.replace("lib", "").replace('-', ""),             // libfoo-bar → foobar
+    ];
+    for variant in &variants {
+        let found = std::process::Command::new("pkg-config")
+            .args(["--exists", variant])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if found { return true; }
     }
 
-    let _ = fs::remove_dir_all(&tmp_dir);
-    Ok(())
+    // 6. Direct filesystem checks for manually installed packages
+    // Checks /usr, /usr/local, /opt for binaries, libs, headers
+    let search_name = dep.trim_start_matches("lib");
+    let fs_checks = [
+        // Binary
+        format!("/usr/bin/{}", dep),
+        format!("/usr/local/bin/{}", dep),
+        format!("/usr/sbin/{}", dep),
+        // Library (with common suffixes)
+        format!("/usr/lib/lib{}.so", dep),
+        format!("/usr/local/lib/lib{}.so", dep),
+        format!("/usr/lib/lib{}.a", dep),
+        // Header (covers manually compiled dev packages)
+        format!("/usr/include/{}", dep),
+        format!("/usr/include/{}", search_name),
+        format!("/usr/local/include/{}", dep),
+        // pkg-config file directly
+        format!("/usr/lib/pkgconfig/{}.pc", dep),
+        format!("/usr/share/pkgconfig/{}.pc", dep),
+        format!("/usr/local/lib/pkgconfig/{}.pc", dep),
+    ];
+    if fs_checks.iter().any(|p| Path::new(p).exists()) {
+        return true;
+    }
+
+    false
 }
 
-fn try_arch(package: &str, dest: &Path) -> Result<String, String> {
-    let (pkg_url, version) = arch_find_pkg(package)?;
-    let pkg_tmp = dest.parent().unwrap_or(Path::new("/tmp"))
-        .join(format!("chiral-{}.pkg.tar.zst", package));
+/// Resolve full dependency tree for a package.
+/// Returns packages in install order (deps first, requested package last).
+/// Skips anything already satisfied by chiral DB or host OS.
+/// Detects circular deps and breaks the cycle rather than looping forever.
+pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
+    let host_pm = detect_host_pm();
 
-    download(&pkg_url, &pkg_tmp)?;
-    extract_pkg_zst(&pkg_tmp, dest)?;
-    let _ = fs::remove_file(&pkg_tmp);
-    Ok(version)
+    // dep_map: pkgname → its direct deps (from Arch API)
+    let mut dep_map: HashMap<String, Vec<String>> = HashMap::new();
+    // visited: packages we've already fetched deps for
+    let mut visited: HashSet<String> = HashSet::new();
+    // queue for BFS
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    queue.push_back(package.to_string());
+
+    while let Some(pkg) = queue.pop_front() {
+        if visited.contains(&pkg) { continue; }
+        visited.insert(pkg.clone());
+
+        // Skip if already satisfied by system or chiral
+        if system_has(&pkg, &host_pm) {
+            dep_map.entry(pkg).or_default();
+            continue;
+        }
+
+        // Query Arch for deps — if Arch doesn't know it, treat as no deps
+        let deps = match arch_query(&pkg) {
+            Ok(info) => info.depends,
+            Err(_)   => vec![],
+        };
+
+        let clean_deps: Vec<String> = deps.iter()
+            .map(|d| strip_ver(d))
+            .filter(|d| !d.is_empty())
+            .collect();
+
+        for dep in &clean_deps {
+            if !visited.contains(dep) {
+                queue.push_back(dep.clone());
+            }
+        }
+
+        dep_map.insert(pkg, clean_deps);
+    }
+
+    // Topological sort (Kahn's algorithm) so deps install before dependents
+    let mut in_degree: HashMap<String, usize> = HashMap::new();
+    for (pkg, deps) in &dep_map {
+        in_degree.entry(pkg.clone()).or_insert(0);
+        for dep in deps {
+            if dep_map.contains_key(dep) {
+                *in_degree.entry(dep.clone()).or_insert(0) += 0; // ensure key exists
+                // pkg depends on dep → dep must come first
+                // in_degree tracks how many things each node depends on
+            }
+        }
+    }
+
+    // Build reverse: for each pkg, which pkgs depend on it
+    let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+    let mut indeg: HashMap<String, usize> = HashMap::new();
+
+    for (pkg, deps) in &dep_map {
+        indeg.entry(pkg.clone()).or_insert(0);
+        for dep in deps {
+            if dep_map.contains_key(dep) {
+                reverse.entry(dep.clone()).or_default().push(pkg.clone());
+                *indeg.entry(pkg.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Start with nodes that have no deps (in-degree 0)
+    let mut ready: VecDeque<String> = indeg.iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    let mut order: Vec<String> = Vec::new();
+
+    while let Some(pkg) = ready.pop_front() {
+        order.push(pkg.clone());
+        if let Some(dependents) = reverse.get(&pkg) {
+            for dep in dependents {
+                let d = indeg.entry(dep.clone()).or_insert(0);
+                if *d > 0 { *d -= 1; }
+                if *d == 0 { ready.push_back(dep.clone()); }
+            }
+        }
+    }
+
+    // Filter out: satisfied by system/chiral, and the root package itself
+    let host_pm2 = detect_host_pm();
+    let result: Vec<String> = order.into_iter()
+        .filter(|p| p != package && !system_has(p, &host_pm2))
+        .collect();
+
+    Ok(result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Download with fallback — returns (source, version)
+// Download with fallback chain — returns (source, version, deps)
+// deps only populated when Arch is used (that's where we get them)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn download_package(ui: &mut ChiralUI, package: &str, dest: &Path) -> Result<(String, String), String> {
+fn download_package(
+    ui: &mut ChiralUI,
+    package: &str,
+    dest: &Path,
+) -> Result<(String, String), String> {
     // Try 1: GitHub
     let url = format!("{}/{}.tar.gz", SERVER, package);
     ui.render_progress_frame(20, 100, &[format!("Trying GitHub packages/{}.tar.gz", package)], false);
@@ -436,22 +722,37 @@ fn download_package(ui: &mut ChiralUI, package: &str, dest: &Path) -> Result<(St
 
     // Try 2: Debian
     ui.render_progress_frame(35, 100, &["Not in repo — trying Debian stable...".to_string()], false);
-    match try_debian(package, dest) {
-        Ok(version) => return Ok(("debian".to_string(), version)),
-        Err(_) => {}
+    if let Ok(version) = try_debian(package, dest) {
+        return Ok(("debian".to_string(), version));
     }
 
     // Try 3: Arch
     ui.render_progress_frame(50, 100, &["Trying Arch Linux repos...".to_string()], false);
-    match try_arch(package, dest) {
-        Ok(version) => return Ok(("arch".to_string(), version)),
-        Err(_) => {}
+    if let Ok((version, _deps)) = try_arch(package, dest) {
+        return Ok(("arch".to_string(), version));
     }
 
     Err(format!(
         "'{}' not found in GitHub packages, Debian stable, or Arch Linux repos.",
         package
     ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Install a single package (no dep resolution — used internally)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn install_one(ui: &mut ChiralUI, package: &str, prefix: &Path) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!("chiral-{}.tar.gz", package));
+    let (source, version) = download_package(ui, package, &tmp)?;
+
+    ui.render_progress_frame(65, 100, &[format!("Extracting {} {}", package, version)], false);
+    let placed = extract(&tmp, prefix)?;
+    let _ = fs::remove_file(&tmp);
+
+    db_add(package, &version, &source, &placed)?;
+    ui.render_progress_frame(100, 100, &[format!("✓ {} {} [{}]", package, version, source)], false);
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -478,7 +779,6 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
 
         if safe.as_os_str().is_empty() { continue; }
 
-        // Strip leading "usr/" or "./" so both Debian and Arch layouts work
         let rel: PathBuf = {
             let mut comps = safe.components();
             let first = comps.next()
@@ -592,16 +892,33 @@ pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
     fs::create_dir_all(&prefix)
         .map_err(|e| format!("Cannot create prefix dir: {}", e))?;
 
-    let tmp = std::env::temp_dir().join(format!("chiral-{}.tar.gz", package));
-    let (source, version) = download_package(ui, package, &tmp)?;
+    // Resolve dependency tree
+    ui.render_progress_frame(5, 100, &[format!("Resolving deps for {}...", package)], false);
+    let deps = resolve_deps(package)?;
 
-    ui.render_progress_frame(65, 100, &[format!("Extracting {} {}", package, version)], false);
-    let placed = extract(&tmp, &prefix)?;
-    let _ = fs::remove_file(&tmp);
+    if !deps.is_empty() {
+        println!("\n📦 Will install {} dependencies first:", deps.len());
+        for d in &deps {
+            println!("   + {}", d);
+        }
+        println!();
+    }
 
-    db_add(package, &version, &source, &placed)?;
+    // Install each dep in order (deepest first)
+    let host_pm = detect_host_pm();
+    for dep in &deps {
+        if system_has(dep, &host_pm) {
+            println!("  ✓ {} already on system — skipping", dep);
+            continue;
+        }
+        println!("  Installing dep: {}", dep);
+        install_one(ui, dep, &prefix)?;
+    }
 
-    ui.render_progress_frame(100, 100, &[format!("Installed {} {} ({} files) [{}]", package, version, placed.len(), source)], false);
+    // Install the requested package itself
+    println!("\n  Installing: {}", package);
+    install_one(ui, package, &prefix)?;
+
     ui.finish();
     path_hint(&prefix);
     Ok(())
@@ -667,10 +984,10 @@ pub fn update_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {
         ));
     }
 
-    ui.render_progress_frame(0, 100, &[format!("Updating {}", package)], false);
-
     let prefix = install_prefix()?;
     let tmp    = std::env::temp_dir().join(format!("chiral-{}.tar.gz", package));
+
+    ui.render_progress_frame(0, 100, &[format!("Updating {}", package)], false);
     let (source, version) = download_package(ui, package, &tmp)?;
 
     ui.render_progress_frame(65, 100, &["Extracting".to_string()], false);
@@ -737,13 +1054,13 @@ pub fn list_installed() -> Result<(), String> {
     }
 
     println!("Installed packages:");
-    println!("{}", "─".repeat(50));
+    println!("{}", "─".repeat(55));
     println!("  {:<20} {:<20} {}", "Name", "Version", "Source");
-    println!("{}", "─".repeat(50));
+    println!("{}", "─".repeat(55));
     for (name, version, source) in &entries {
         println!("  {:<20} {:<20} {}", name, version, source);
     }
-    println!("{}", "─".repeat(50));
+    println!("{}", "─".repeat(55));
     println!("Total: {} package(s)", entries.len());
     Ok(())
 }
@@ -760,45 +1077,73 @@ pub fn info_package(package: &str) -> Result<(), String> {
     let files  = db_files_for(package)?;
     let prefix = install_prefix()?;
 
-    println!("{}", "─".repeat(50));
+    // Also show deps from Arch if available
+    let deps = arch_query(package)
+        .map(|p| p.depends)
+        .unwrap_or_default();
+
+    println!("{}", "─".repeat(55));
     println!("  Package : {}", package);
     println!("  Version : {}", version);
     println!("  Source  : {}", source);
     println!("  Prefix  : {}", prefix.display());
     println!("  Files   : {}", files.len());
-    println!("{}", "─".repeat(50));
 
-    // Group files by type for a cleaner view
-    let mut bins: Vec<&PathBuf>  = Vec::new();
-    let mut libs: Vec<&PathBuf>  = Vec::new();
-    let mut hdrs: Vec<&PathBuf>  = Vec::new();
-    let mut mans: Vec<&PathBuf>  = Vec::new();
-    let mut rest: Vec<&PathBuf>  = Vec::new();
+    if !deps.is_empty() {
+        println!("  Deps    : {}", deps.join(", "));
+    }
+
+    println!("{}", "─".repeat(55));
+
+    let mut bins: Vec<&PathBuf> = Vec::new();
+    let mut libs: Vec<&PathBuf> = Vec::new();
+    let mut hdrs: Vec<&PathBuf> = Vec::new();
+    let mut mans: Vec<&PathBuf> = Vec::new();
+    let mut rest: Vec<&PathBuf> = Vec::new();
 
     for f in &files {
         let s = f.to_string_lossy();
-        if s.contains("/bin/")                      { bins.push(f); }
-        else if s.contains("/lib/")                 { libs.push(f); }
-        else if s.contains("/include/")             { hdrs.push(f); }
-        else if s.contains("/man/")                 { mans.push(f); }
-        else                                        { rest.push(f); }
+        if s.contains("/bin/")      { bins.push(f); }
+        else if s.contains("/lib/") { libs.push(f); }
+        else if s.contains("/include/") { hdrs.push(f); }
+        else if s.contains("/man/") { mans.push(f); }
+        else                        { rest.push(f); }
     }
 
     let print_group = |label: &str, group: &[&PathBuf]| {
         if !group.is_empty() {
             println!("  {}:", label);
-            for f in group {
-                println!("    {}", f.display());
-            }
+            for f in group { println!("    {}", f.display()); }
         }
     };
 
-    print_group("Binaries", &bins);
+    print_group("Binaries",  &bins);
     print_group("Libraries", &libs);
-    print_group("Headers", &hdrs);
+    print_group("Headers",   &hdrs);
     print_group("Man pages", &mans);
-    print_group("Other", &rest);
+    print_group("Other",     &rest);
 
-    println!("{}", "─".repeat(50));
+    println!("{}", "─".repeat(55));
+    Ok(())
+}
+
+/// chiral deps <package> — show what would be installed without installing
+pub fn show_deps(package: &str) -> Result<(), String> {
+    println!("Resolving dependencies for '{}'...", package);
+
+    let deps = resolve_deps(package)?;
+
+    if deps.is_empty() {
+        println!("  No uninstalled dependencies found.");
+        return Ok(());
+    }
+
+    println!("\n📦 Would install {} package(s) in this order:", deps.len());
+    println!("{}", "─".repeat(40));
+    for (i, dep) in deps.iter().enumerate() {
+        println!("  {}. {}", i + 1, dep);
+    }
+    println!("{}", "─".repeat(40));
+    println!("Then: {}", package);
     Ok(())
 }

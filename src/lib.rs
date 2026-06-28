@@ -9,16 +9,15 @@ use std::path::{Path, PathBuf};
 use tar::Archive;
 use crate::ui::ChiralUI;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Package repositories
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 const SERVER: &str = "https://raw.githubusercontent.com/Amaterus1125/chpm/main/packages";
 const ARCH_MIRROR: &str = "https://mirror.rackspace.com/archlinux";
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // Paths
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn is_root() -> bool {
     unsafe { libc::getuid() == 0 }
@@ -50,13 +49,12 @@ fn db_file() -> Result<PathBuf, String> {
     Ok(db_dir()?.join("installed.db"))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // File tracking DB
 // Format:
 //   [pkgname=1.2.3|debian]
 //   /usr/local/bin/foo
-//   ...
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn db_ensure() -> Result<(), String> {
     let dir  = db_dir()?;
@@ -172,9 +170,8 @@ fn db_remove_entry(package: &str) -> Result<(), String> {
     fs::write(db_file()?, new_content).map_err(|e| e.to_string())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Download
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     let mut response = reqwest::blocking::get(url)
@@ -194,9 +191,9 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // Arch API — returns full package info including deps
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 struct ArchPkg {
     repo:     String,
@@ -325,9 +322,8 @@ fn try_arch(package: &str, dest: &Path) -> Result<(String, Vec<String>), String>
     Ok((version, deps))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Debian fallback
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn debian_find_deb(package: &str) -> Result<(String, String), String> {
     let client = reqwest::blocking::Client::new();
@@ -429,7 +425,7 @@ fn try_debian(package: &str, dest: &Path) -> Result<String, String> {
     Ok(version)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // Dependency resolution
 //
 // Uses Arch API for dep lists (most complete and structured).
@@ -438,7 +434,6 @@ fn try_debian(package: &str, dest: &Path) -> Result<String, String> {
 //
 // Returns Vec<String> in install order, NOT including packages already
 // installed, NOT including the root package itself (caller installs that).
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Strip version constraints from a dep string e.g. "glib2>=2.80" → "glib2"
 fn strip_ver(dep: &str) -> String {
@@ -703,10 +698,10 @@ pub fn resolve_deps(package: &str) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // Download with fallback chain — returns (source, version, deps)
 // deps only populated when Arch is used (that's where we get them)
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn download_package(
     ui: &mut ChiralUI,
@@ -738,9 +733,9 @@ fn download_package(
     ))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // Install a single package (no dep resolution — used internally)
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn install_one(ui: &mut ChiralUI, package: &str, prefix: &Path) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!("chiral-{}.tar.gz", package));
@@ -755,9 +750,9 @@ fn install_one(ui: &mut ChiralUI, package: &str, prefix: &Path) -> Result<(), St
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // Extract
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
     let mut archive = Archive::new(GzDecoder::new(
@@ -843,9 +838,9 @@ fn extract(tarball: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(placed)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // PATH / ldconfig hint
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 fn path_hint(prefix: &Path) {
     let bin_dir = prefix.join("bin");
@@ -872,9 +867,9 @@ fn path_hint(prefix: &Path) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+
 // PUBLIC API
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// chiral install <package>
 pub fn install_binary(ui: &mut ChiralUI, package: &str) -> Result<(), String> {

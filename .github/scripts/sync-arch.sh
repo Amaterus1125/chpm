@@ -3,8 +3,7 @@
 # For every .tar.gz in packages/, check if Arch has a newer version.
 # If yes, download, repack, replace.
 
-set -e
-
+# do NOT set -e — one package failure should not stop the whole sync
 PACKAGES_DIR="packages"
 ARCH_API="https://archlinux.org/packages/search/json/?name="
 ARCH_MIRROR="https://mirror.rackspace.com/archlinux"
@@ -85,10 +84,12 @@ for pkg_file in "$PACKAGES_DIR"/*.tar.gz; do
 
     echo "  ✓ Done: $pkgname $new_version [arch/$repo]"
 
-    # Cleanup
+    # Cleanup — chmod first to handle root-owned files from /etc in packages
+    chmod -R u+w "$stage" 2>/dev/null || true
     rm -rf "$stage" "$pkg_tmp"
 done
 
+chmod -R u+w "$TMP" 2>/dev/null || true
 rm -rf "$TMP"
 echo "──────────────────────────────────────"
 echo "Arch sync complete."

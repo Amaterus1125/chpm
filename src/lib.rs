@@ -1275,7 +1275,7 @@ pub fn self_update() -> Result<(), String> {
     let latest = json["tag_name"]
         .as_str()
         .ok_or("Could not get latest version")?
-        .trim_start_matches('v');
+        .trim_start_matches('v');+
 
     if latest == CURRENT_VERSION {
         println!("Already up to date (v{}).", CURRENT_VERSION);
@@ -1288,7 +1288,10 @@ pub fn self_update() -> Result<(), String> {
         .ok_or("No assets in release")?;
 
     let binary_url = assets.iter()
-        .find(|a| a["name"].as_str().unwrap_or("") == "chiral")
+        .find(|a| {
+    let name = a["name"].as_str().unwrap_or("");
+    name == "chiral" || name.starts_with("chiral-x86_64")
+})
         .and_then(|a| a["browser_download_url"].as_str())
         .ok_or("No 'chiral' binary found in release assets")?
         .to_string();
